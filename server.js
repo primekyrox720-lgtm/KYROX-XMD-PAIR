@@ -7,7 +7,9 @@ const {
     useMultiFileAuthState,
     delay,
     makeCacheableSignalKeyStore,
-    fetchLatestBaileysVersion
+    fetchLatestBaileysVersion,
+    Browsers,
+    DisconnectReason
 } = require("@whiskeysockets/baileys");
 
 const app = express();
@@ -16,21 +18,23 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-// Endpoint pour demander le Pair Code
 app.post("/api/pair-code", async (req, res) => {
     let { phone } = req.body;
 
     if (!phone) {
-        return res.status(400).json({ error: "Veuillez fournir un numéro de téléphone." });
+        return res.status(400).json({ error: "Numéro de téléphone requis." });
     }
 
-    // Nettoyage du numéro (supprime +, espaces, tirets)
+    // Nettoyage strict du numéro
     phone = phone.replace(/[^0-9]/g, "");
+    console.log(`\n[Pairing] Début de la procédure pour : ${phone}`);
 
     const tempSessionId = `session_${phone}_${Date.now()}`;
     const tempDir = path.join(__dirname, "temp", tempSessionId);
 
-    try {
+    let isCodeSent = false;
+
+    async function initSocket() {
         const { state, saveCreds } = await useMultiFileAuthState(tempDir);
         const { version } = await fetchLatestBaileysVersion();
 
@@ -41,61 +45,90 @@ app.post("/api/pair-code", async (req, res) => {
                 creds: state.creds,
                 keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" }))
             },
-            browser: ["Ubuntu", "Chrome", "20.0.04"]
+            // Empreinte reconnue officiellement par WhatsApp pour éviter les rejets
+            browser: Browsers.macOS("Safari"),
+            syncFullHistory: false,
+            generateHighQualityLinkPreview: false
         });
 
         sock.ev.on("creds.update", saveCreds);
 
-        // Si le client n'est pas encore enregistré, on demande le code
-        if (!sock.authState.creds.registered) {
-            await delay(1500); // Petit délai indispensable pour Baileys
-            const code = await sock.requestPairingCode(phone);
-            res.json({ success: true, code: code });
+        // Si le code n'a pas encore été envoyé au site web
+        if (!sock.authState.creds.registered && !isCodeSent) {
+            await delay(2500); // Délai nécessaire pour que le socket soit bien établi
+            try {
+                const code = await sock.requestPairingCode(phone);
+                console.log(`[Pairing] Code généré avec succès : ${code}`);
+                isCodeSent = true;
+                res.json({ success: true, code: code });
+            } catch (err) {
+                console.error("[Pairing] Erreur génération code :", err.message);
+                if (!res.headersSent) {
+                    return res.status(500).json({ error: "Erreur lors de la demande du code. Vérifiez le format du numéro." });
+                }
+            }
         }
 
-        // Écoute de la connexion
+        // Surveillance de la connexion (Gère la fameuse coupure 515)
         sock.ev.on("connection.update", async (update) => {
-            const { connection } = update;
+            const { connection, lastDisconnect } = update;
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
 
-            if (connection === "open") {
+            if (connection === "close") {
+                console.log(`[Pairing] Connexion interrompue (Code: ${statusCode}).`);
+
+                // Si WhatsApp demande un redémarrage (Code 515) ou coupure temporaire, ON RECONNECTE IMMÉDIATEMENT
+                if (statusCode === DisconnectReason.restartRequired || statusCode === 515 || statusCode !== DisconnectReason.loggedOut) {
+                    console.log("[Pairing] Finalisation de la liaison... Reconnexion en cours.");
+                    initSocket(); // Relance avec le même dossier temporaire pour finaliser la liaison
+                } else {
+                    console.log("[Pairing] Session annulée ou expirée.");
+                    fs.rmSync(tempDir, { recursive: true, force: true });
+                }
+            } else if (connection === "open") {
+                console.log("✅ [Pairing] Liaison WhatsApp validée avec succès !");
+
                 await delay(3000);
 
-                // Lire les identifiants enregistrés
                 const credsPath = path.join(tempDir, "creds.json");
                 if (fs.existsSync(credsPath)) {
                     const credsData = fs.readFileSync(credsPath, "utf-8");
-                    // Encoder en base64 pour avoir un SESSION_ID compact
                     const sessionId = "Kyrox~" + Buffer.from(credsData).toString("base64");
-
                     const userJid = `${phone}@s.whatsapp.net`;
 
-                    // Envoi du SESSION_ID sur le WhatsApp de l'utilisateur
+                    // Envoi du SESSION_ID sur WhatsApp
                     await sock.sendMessage(userJid, {
                         text: `╔═══════════════════════╗\n` +
                               `║   *KYROX-MD SESSION ID*    \n` +
                               `╚═══════════════════════╝\n\n` +
-                              `Voici votre identifiant de session :\n\n` +
+                              `Votre bot est prêt ! Voici votre identifiant de session :\n\n` +
                               `\`\`\`${sessionId}\`\`\`\n\n` +
-                              `⚠️ *ATTENTION :* Ne partagez ce code avec personne ! Il donne l'accès à votre WhatsApp.`
+                              `⚠️ *Attention :* Conservez cette clé précieusement et ne la partagez jamais.`
                     });
 
-                    await delay(2000);
-                    // Déconnexion et suppression du dossier temporaire
+                    console.log("📩 [Pairing] Session envoyée sur le WhatsApp de l'utilisateur !");
+
+                    await delay(3000);
                     await sock.logout();
                     fs.rmSync(tempDir, { recursive: true, force: true });
                 }
             }
         });
+    }
 
-    } catch (error) {
-        console.error("Erreur pairing:", error);
+    try {
+        await initSocket();
+    } catch (e) {
+        console.error("[Pairing] Erreur critique :", e);
+        if (!res.headersSent) {
+            res.status(500).json({ error: "Erreur serveur interne." });
+        }
         if (fs.existsSync(tempDir)) {
             fs.rmSync(tempDir, { recursive: true, force: true });
         }
-        res.status(500).json({ error: "Échec de génération du code. Vérifiez le numéro." });
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Serveur Kyrox-Session démarré sur http://localhost:${PORT}`);
+    console.log(`Serveur Kyrox-Session prêt sur le port ${PORT}`);
 });
