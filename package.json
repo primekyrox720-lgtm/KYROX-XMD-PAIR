@@ -1,0 +1,14 @@
+{
+  "name": "kyrox-session-server",
+  "version": "1.0.0",
+  "description": "Serveur de Pair Code et Session pour Kyrox-MD",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.12",
+    "express": "^4.19.2",
+    "pino": "^9.1.0"
+  }
+}
